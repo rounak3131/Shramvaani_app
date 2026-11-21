@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 const RAW_API =
   (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_URL) ||
   (typeof process !== 'undefined' && process.env?.REACT_APP_API_URL) ||
-  'http://localhost:5000/api';
+  'https://shramvaani-backend.onrender.com//api';
 const API_BASE = RAW_API.replace(/\/+$/, '');
 
 const FALLBACK_LANGUAGES = {
