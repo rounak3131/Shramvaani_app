@@ -13,7 +13,7 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', secrets.token_hex(32))
 
 # Auto-connects to Render Cloud PostgreSQL (DATABASE_URL) for multi-year storage
-db_url = (os.getenv('DATABASE_URL') or os.getenv('DATABASE_URI') or 'sqlite:///shramvaani_live_v5.db').strip()
+db_url = (os.getenv('DATABASE_URL') or os.getenv('DATABASE_URI') or 'sqlite:///shramvaani_live_v6.db').strip()
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = db_url
@@ -95,6 +95,17 @@ def validate_verhoeff_12digit(num_str: str) -> bool:
 
 # ==================== DATABASE MODELS ====================
 
+class UserAccount(db.Model):
+    __tablename__ = 'user_accounts'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    mobile = db.Column(db.String(15), nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False)  # 'worker' or 'employer'
+    name = db.Column(db.String(100), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    age = db.Column(db.String(10), default='')
+    skill = db.Column(db.String(80), default='Electrician')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 class PlatformConfig(db.Model):
     __tablename__ = 'platform_config'
     id = db.Column(db.Integer, primary_key=True)
@@ -133,8 +144,12 @@ class JobPosting(db.Model):
     shift_time = db.Column(db.String(80), nullable=False)
     wage = db.Column(db.Float, nullable=False)
     employer_name = db.Column(db.String(100), nullable=False)
+    employer_mobile = db.Column(db.String(15), default='')
     employer_verified = db.Column(db.Boolean, default=False)
-    status = db.Column(db.String(30), default='OPEN')
+    status = db.Column(db.String(30), default='OPEN')  # OPEN -> ACCEPTED -> COMPLETED
+    accepted_by = db.Column(db.String(100), nullable=True)
+    accepted_by_mobile = db.Column(db.String(15), nullable=True)
+    otp = db.Column(db.String(4), default='4829')
 
 class PaymentOrder(db.Model):
     __tablename__ = 'payment_orders'
@@ -152,9 +167,10 @@ class EscrowTransaction(db.Model):
     __tablename__ = 'transactions'
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     order_id = db.Column(db.String(24), nullable=False)
-    utr = db.Column(db.String(12), unique=True, nullable=False, index=True)
+    utr = db.Column(db.String(20), unique=True, nullable=False, index=True)
     worker_id = db.Column(db.String(36), nullable=False, index=True)
     worker_name = db.Column(db.String(100), default='Raju Kumar')
+    worker_mobile = db.Column(db.String(15), default='')
     employer_name = db.Column(db.String(100), nullable=False)
     job_title = db.Column(db.String(150), default='Residential Flooring & Plaster')
     job_location = db.Column(db.String(150), default='Sector 62, Noida')
@@ -209,7 +225,8 @@ with app.app_context():
             address='Plot C-56/4, Institutional Area, Sector 62, Noida, UP',
             lat=28.6273, lng=77.3725,
             shift_time='Tomorrow • 08:30 AM – 05:30 PM',
-            wage=750.0, employer_name='Sharma Builders (Demo)', employer_verified=False, status='OPEN'
+            wage=750.0, employer_name='Sharma Builders (Demo)', employer_verified=False,
+            status='OPEN', otp=str(secrets.randbelow(9000) + 1000)
         ))
     db.session.commit()
 
@@ -236,7 +253,91 @@ def is_fake_or_dummy_utr(utr: str) -> tuple[bool, str]:
         return True, "Invalid NPCI Bank Switch Prefix (Real UPI UTRs start with 3, 4, 5, 6, or 7)."
     return False, "Valid NPCI Structure"
 
-# ==================== PUBLIC & SELF-SERVICE REGISTRATION APIs ====================
+# ==================== CROSS-DEVICE AUTH & FORGOT PASSWORD APIs ====================
+
+@app.route('/api/auth/login', methods=['POST'])
+def api_auth_login():
+    data = request.json or {}
+    mobile = str(data.get('mobile', '')).strip()
+    password = str(data.get('password', '')).strip()
+    role = str(data.get('role', 'worker')).strip()
+    name = str(data.get('name', '')).strip()
+
+    if len(mobile) < 10 or not password:
+        return jsonify({"success": False, "message": "10-अंकों का मोबाइल नंबर और पासवर्ड ज़रूरी है"}), 400
+
+    acc = UserAccount.query.filter_by(mobile=mobile, role=role).first()
+    if acc:
+        if not check_password_hash(acc.password_hash, password):
+            return jsonify({"success": False, "message": "❌ गलत पासवर्ड! सही पासवर्ड डालें या Forgot Password दबाएं।"}), 401
+        return jsonify({
+            "success": True,
+            "user": {
+                "name": acc.name,
+                "mobile": acc.mobile,
+                "role": acc.role,
+                "age": acc.age,
+                "skill": acc.skill
+            }
+        })
+    else:
+        final_name = name if name else ('मज़दूर' if role == 'worker' else 'काम देने वाला')
+        new_acc = UserAccount(
+            mobile=mobile,
+            role=role,
+            name=final_name,
+            password_hash=generate_password_hash(password),
+            age='',
+            skill='Electrician'
+        )
+        db.session.add(new_acc)
+        db.session.commit()
+        return jsonify({
+            "success": True,
+            "user": {
+                "name": new_acc.name,
+                "mobile": new_acc.mobile,
+                "role": new_acc.role,
+                "age": new_acc.age,
+                "skill": new_acc.skill
+            }
+        }), 201
+
+@app.route('/api/auth/reset-password', methods=['POST'])
+def api_auth_reset_password():
+    data = request.json or {}
+    mobile = str(data.get('mobile', '')).strip()
+    role = str(data.get('role', 'worker')).strip()
+    new_password = str(data.get('new_password', '')).strip()
+
+    if len(mobile) < 10 or not new_password:
+        return jsonify({"success": False, "message": "मोबाइल नंबर और नया पासवर्ड दोनों डालें"}), 400
+
+    acc = UserAccount.query.filter_by(mobile=mobile, role=role).first()
+    if not acc:
+        return jsonify({"success": False, "message": "इस मोबाइल नंबर से कोई खाता नहीं मिला। पहले नया खाता बनाएं।"}), 404
+
+    acc.password_hash = generate_password_hash(new_password)
+    db.session.commit()
+    return jsonify({"success": True, "message": "✅ नया पासवर्ड सेव हो गया है! अब नए पासवर्ड से लॉगिन करें।"})
+
+@app.route('/api/auth/update-profile', methods=['POST'])
+def api_auth_update_profile():
+    data = request.json or {}
+    mobile = str(data.get('mobile', '')).strip()
+    role = str(data.get('role', 'worker')).strip()
+    acc = UserAccount.query.filter_by(mobile=mobile, role=role).first()
+    if acc:
+        if data.get('name'):
+            acc.name = str(data['name']).strip()
+        if 'age' in data:
+            acc.age = str(data['age']).strip()
+        if data.get('skill'):
+            acc.skill = str(data['skill']).strip()
+        db.session.commit()
+    return jsonify({"success": True})
+
+# ==================== PUBLIC & JOB APIs ====================
 
 @app.route('/', methods=['GET'])
 def health_check():
@@ -255,21 +356,8 @@ def get_public_config():
 def get_languages():
     return jsonify(LANGUAGES)
 
-@app.route('/api/workers', methods=['GET', 'POST'])
+@app.route('/api/workers', methods=['GET'])
 def handle_workers():
-    if request.method == 'POST':
-        data = request.json or {}
-        name = str(data.get('name', '')).strip()
-        skill = str(data.get('skill', '')).strip()
-        wage = float(data.get('daily_wage', 750))
-        if not name or not skill:
-            return jsonify({"success": False, "message": "Name and skill are required."}), 400
-        new_id = f"W-{secrets.randbelow(900) + 102}"
-        w = WorkerProfile(id=new_id, name=name, skill=skill, daily_wage=wage)
-        db.session.add(w)
-        db.session.commit()
-        return jsonify({"success": True, "worker_id": w.id, "name": w.name}), 201
-
     workers = WorkerProfile.query.all()
     return jsonify([{
         "id": w.id, "name": w.name, "skill": w.skill,
@@ -278,9 +366,7 @@ def handle_workers():
 
 @app.route('/api/worker/<worker_id>', methods=['GET'])
 def get_worker(worker_id):
-    w = db.session.get(WorkerProfile, worker_id)
-    if not w:
-        w = WorkerProfile.query.first()
+    w = db.session.get(WorkerProfile, worker_id) or WorkerProfile.query.first()
     next_job = JobPosting.query.order_by(JobPosting.id.desc()).first()
     active_locked_tx = EscrowTransaction.query.filter_by(worker_id=w.id, status='LOCKED').order_by(EscrowTransaction.created_at.desc()).first()
     return jsonify({
@@ -315,7 +401,7 @@ def verify_identity():
         if not validate_verhoeff_12digit(doc_number):
             return jsonify({
                 "success": False,
-                "message": "Invalid UAN Checksum! Random or sequential numbers fail Verhoeff mathematical validation."
+                "message": "Invalid UAN Number! Please enter a valid 12-digit e-Shram UAN."
             }), 400
         w = db.session.get(WorkerProfile, worker_id) or WorkerProfile.query.first()
         w.kyc_status = 'PENDING_ADMIN'
@@ -325,7 +411,7 @@ def verify_identity():
         db.session.commit()
         return jsonify({
             "success": True,
-            "message": "Checksum Valid! Sent to Admin Portal for final badge approval."
+            "message": "UAN Valid! Sent to Admin Portal for final badge approval."
         })
 
     if role == 'employer':
@@ -396,22 +482,20 @@ def unlock_commitment(worker_id):
 
 @app.route('/api/jobs', methods=['GET', 'POST'])
 def handle_jobs():
-    """Allows any Employer directly from Employer Portal to post a new job requirement!"""
+    """Employer posts a job -> Broadcasts to all workers with secret OTP for Employer"""
     if request.method == 'POST':
         data = request.json or {}
         employer_name = str(data.get('employer_name', '')).strip()
+        employer_mobile = str(data.get('employer_mobile', '')).strip()
         title = str(data.get('title', '')).strip()
         location = str(data.get('location', '')).strip()
         address = str(data.get('address', location)).strip()
         shift_time = str(data.get('shift_time', 'Tomorrow • 09:00 AM')).strip()
         wage = float(data.get('wage', 750))
+        otp_code = str(data.get('otp') or (secrets.randbelow(9000) + 1000))
 
         if not employer_name or not title or not location:
             return jsonify({"success": False, "message": "Your Name, Work Type, and Location are required."}), 400
-
-        emp = db.session.get(EmployerProfile, 'EMP-01')
-        if emp:
-            emp.company_name = employer_name
 
         offset = (JobPosting.query.count() % 8) * 0.012
         job = JobPosting(
@@ -423,20 +507,73 @@ def handle_jobs():
             shift_time=shift_time,
             wage=wage,
             employer_name=employer_name,
-            employer_verified=(emp.kyc_status == 'VERIFIED') if emp else False,
-            status='OPEN'
+            employer_mobile=employer_mobile,
+            employer_verified=True,
+            status='OPEN',
+            otp=otp_code
         )
         db.session.add(job)
         db.session.commit()
-        return jsonify({"success": True, "id": job.id, "message": "Job published live!"}), 201
+        return jsonify({"success": True, "id": job.id, "otp": job.otp, "message": "Job published live!"}), 201
 
     jobs = JobPosting.query.order_by(JobPosting.id.desc()).all()
     return jsonify([{
         "id": j.id, "title": j.title, "location": j.location, "address": j.address,
         "lat": j.lat, "lng": j.lng, "shift_time": j.shift_time,
-        "wage": j.wage, "employer_name": j.employer_name,
-        "employer_verified": j.employer_verified, "status": j.status
+        "wage": j.wage, "employer_name": j.employer_name, "employer_mobile": j.employer_mobile,
+        "employer_verified": j.employer_verified, "status": j.status,
+        "accepted_by": j.accepted_by, "accepted_by_mobile": j.accepted_by_mobile, "otp": j.otp
     } for j in jobs])
+
+@app.route('/api/jobs/<int:job_id>/accept', methods=['POST'])
+def accept_job(job_id):
+    data = request.json or {}
+    job = db.session.get(JobPosting, job_id)
+    if not job:
+        return jsonify({"success": False, "message": "Job not found"}), 404
+    if job.status != 'OPEN':
+        return jsonify({"success": False, "message": f"Already Accepted by {job.accepted_by}"}), 409
+
+    job.status = 'ACCEPTED'
+    job.accepted_by = str(data.get('worker_name', 'Worker')).strip()
+    job.accepted_by_mobile = str(data.get('worker_mobile', '')).strip()
+    db.session.commit()
+    return jsonify({"success": True, "status": job.status, "accepted_by": job.accepted_by})
+
+@app.route('/api/jobs/<int:job_id>/complete-otp', methods=['POST'])
+def complete_job_with_otp(job_id):
+    data = request.json or {}
+    entered_otp = str(data.get('otp', '')).strip()
+    job = db.session.get(JobPosting, job_id)
+    if not job:
+        return jsonify({"success": False, "message": "Job not found"}), 404
+    if job.otp != entered_otp:
+        return jsonify({"success": False, "message": "❌ गलत OTP! मालिक से सही 4-अंक का कोड पूछें।"}), 401
+
+    job.status = 'COMPLETED'
+    cfg = db.session.get(PlatformConfig, 1)
+    fee = cfg.platform_fee if job.wage >= 200 else 0.0
+    net_wage = job.wage - fee
+
+    tx = EscrowTransaction(
+        order_id=f"ORD-{secrets.randbelow(900000) + 100000}",
+        utr=f"UTR{secrets.randbelow(900000000) + 100000000}",
+        worker_id=job.accepted_by_mobile or 'W-101',
+        worker_name=job.accepted_by or 'Worker',
+        worker_mobile=job.accepted_by_mobile or '',
+        employer_name=job.employer_name,
+        job_title=job.title,
+        job_location=job.location,
+        job_address=job.address,
+        total_amount=job.wage,
+        net_wage=net_wage,
+        platform_fee=fee,
+        release_otp=job.otp,
+        status='RELEASED'
+    )
+    db.session.add(tx)
+    db.session.commit()
+    return jsonify({"success": True, "net_wage": net_wage, "order_id": tx.order_id, "utr": tx.utr})
 
 # ==================== REAL SCANNABLE UPI QR & PERMANENT RECEIPTS ====================
 
@@ -527,7 +664,7 @@ def deposit_escrow():
 
     return jsonify({
         "success": True,
-        "message": f"Booking Confirmed for {w.name}! Real UTR Verified & Secret 4-Digit OTP is now live inside Worker App.",
+        "message": f"Booking Confirmed for {w.name}! Real UTR Verified & Secret 4-Digit OTP is live.",
         "receipt": {
             "id": tx.id, "order_id": tx.order_id, "utr": tx.utr, "worker_id": tx.worker_id,
             "worker_name": tx.worker_name, "employer_name": tx.employer_name,
@@ -554,18 +691,18 @@ def release_escrow(utr):
         db.session.commit()
         return jsonify({
             "success": False,
-            "message": f"Wrong OTP! Match exact 4-digit OTP from Worker App. ({3 - tx.otp_attempts} attempts left)"
+            "message": f"Wrong OTP! ({3 - tx.otp_attempts} attempts left)"
         }), 401
     tx.status = 'RELEASED'
     db.session.commit()
-    return jsonify({"success": True, "status": tx.status, "message": f"All Details & OTP Matched! ₹{tx.net_wage} released to {tx.worker_name}."})
+    return jsonify({"success": True, "status": tx.status, "message": f"OTP Matched! ₹{tx.net_wage} released to {tx.worker_name}."})
 
 @app.route('/api/receipts', methods=['GET'])
 def list_receipts():
     txs = EscrowTransaction.query.order_by(EscrowTransaction.created_at.desc()).all()
     return jsonify([{
         "id": t.id, "order_id": t.order_id, "utr": t.utr, "worker_id": t.worker_id,
-        "worker_name": t.worker_name, "employer_name": t.employer_name,
+        "worker_name": t.worker_name, "worker_mobile": t.worker_mobile, "employer_name": t.employer_name,
         "job_title": t.job_title, "job_location": t.job_location, "job_address": t.job_address,
         "total_amount": t.total_amount, "net_wage": t.net_wage,
         "platform_fee": t.platform_fee, "status": t.status,
@@ -592,7 +729,7 @@ def handle_chat():
         "timestamp": m.timestamp.replace(tzinfo=timezone.utc).astimezone(IST).strftime('%I:%M %p')
     } for m in msgs])
 
-# ==================== SEPARATE OWNER ADMIN APIs ====================
+# ==================== OWNER ADMIN APIs (ESCROW MONEY TRACKING LEDGER) ====================
 
 @app.route('/api/admin/login', methods=['POST'])
 def admin_login():
@@ -619,7 +756,6 @@ def admin_login():
 def admin_dashboard():
     txs = EscrowTransaction.query.order_by(EscrowTransaction.created_at.desc()).all()
     frauds = FraudLog.query.order_by(FraudLog.timestamp.desc()).limit(20).all()
-    jobs = JobPosting.query.order_by(JobPosting.id.desc()).all()
     worker = WorkerProfile.query.filter_by(kyc_status='PENDING_ADMIN').first() or WorkerProfile.query.first()
     emp = db.session.get(EmployerProfile, 'EMP-01')
     cfg = db.session.get(PlatformConfig, 1)
@@ -640,12 +776,16 @@ def admin_dashboard():
             "id": emp.id, "name": emp.company_name, "status": emp.kyc_status,
             "badge": emp.kyc_badge, "doc": emp.gstin_masked or "Not submitted"
         },
-        "jobs": [{
-            "id": j.id, "title": j.title, "location": j.location, "wage": j.wage, "employer_name": j.employer_name
-        } for j in jobs],
         "ledger": [{
-            "order_id": t.order_id, "utr": t.utr, "total_amount": t.total_amount,
-            "net_wage": t.net_wage, "platform_fee": t.platform_fee, "status": t.status,
+            "order_id": t.order_id,
+            "utr": t.utr,
+            "from_employer": t.employer_name,
+            "to_worker": t.worker_name,
+            "job_title": t.job_title,
+            "total_amount": t.total_amount,
+            "net_wage": t.net_wage,
+            "platform_fee": t.platform_fee,
+            "status": t.status,
             "created_at": t.created_at.replace(tzinfo=timezone.utc).astimezone(IST).strftime('%d %b %Y, %I:%M %p')
         } for t in txs],
         "fraud_logs": [{
@@ -683,35 +823,6 @@ def admin_kyc_decision():
         db.session.commit()
         return jsonify({"success": True})
     return jsonify({"success": False}), 400
-
-@app.route('/api/admin/jobs', methods=['POST'])
-@require_admin
-def admin_add_job():
-    data = request.json or {}
-    job = JobPosting(
-        title=data.get('title', 'New Site Work'),
-        location=data.get('location', 'Sector 62, Noida'),
-        address=data.get('address', 'Sector 62, Noida, UP'),
-        lat=float(data.get('lat', 28.6273)),
-        lng=float(data.get('lng', 77.3725)),
-        shift_time=data.get('shift_time', 'Tomorrow • 08:30 AM – 05:30 PM'),
-        wage=float(data.get('wage', 800)),
-        employer_name=data.get('employer_name', 'Sharma Builders'),
-        employer_verified=True,
-        status='OPEN'
-    )
-    db.session.add(job)
-    db.session.commit()
-    return jsonify({"success": True, "id": job.id})
-
-@app.route('/api/admin/jobs/<int:job_id>', methods=['DELETE'])
-@require_admin
-def admin_delete_job(job_id):
-    job = db.session.get(JobPosting, job_id)
-    if job:
-        db.session.delete(job)
-        db.session.commit()
-    return jsonify({"success": True})
 
 @app.route('/api/admin/config', methods=['POST'])
 @require_admin
