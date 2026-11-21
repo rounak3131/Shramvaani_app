@@ -99,7 +99,7 @@ class UserAccount(db.Model):
     __tablename__ = 'user_accounts'
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     mobile = db.Column(db.String(15), nullable=False, index=True)
-    role = db.Column(db.String(20), nullable=False)  # 'worker' or 'employer'
+    role = db.Column(db.String(20), nullable=False)
     name = db.Column(db.String(100), nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     age = db.Column(db.String(10), default='')
@@ -146,7 +146,7 @@ class JobPosting(db.Model):
     employer_name = db.Column(db.String(100), nullable=False)
     employer_mobile = db.Column(db.String(15), default='')
     employer_verified = db.Column(db.Boolean, default=False)
-    status = db.Column(db.String(30), default='OPEN')  # OPEN -> ACCEPTED -> COMPLETED
+    status = db.Column(db.String(30), default='OPEN')
     accepted_by = db.Column(db.String(100), nullable=True)
     accepted_by_mobile = db.Column(db.String(15), nullable=True)
     otp = db.Column(db.String(4), default='4829')
@@ -209,6 +209,21 @@ class FraudLog(db.Model):
 
 with app.app_context():
     db.create_all()
+    # पुराने PostgreSQL डेटाबेस में नए कॉलम सुरक्षित रूप से जोड़ना:
+    alter_queries = [
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS employer_mobile VARCHAR(15) DEFAULT '';",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accepted_by VARCHAR(100);",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accepted_by_mobile VARCHAR(15);",
+        "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS otp VARCHAR(4) DEFAULT '4829';",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS worker_mobile VARCHAR(15) DEFAULT '';"
+    ]
+    for q in alter_queries:
+        try:
+            db.session.execute(db.text(q))
+        except Exception:
+            db.session.rollback()
+    db.session.commit()
+
     if not db.session.get(PlatformConfig, 1):
         db.session.add(PlatformConfig(id=1, platform_fee=50.0))
     if not db.session.get(WorkerProfile, 'W-101'):
@@ -482,7 +497,6 @@ def unlock_commitment(worker_id):
 
 @app.route('/api/jobs', methods=['GET', 'POST'])
 def handle_jobs():
-    """Employer posts a job -> Broadcasts to all workers with secret OTP for Employer"""
     if request.method == 'POST':
         data = request.json or {}
         employer_name = str(data.get('employer_name', '')).strip()
